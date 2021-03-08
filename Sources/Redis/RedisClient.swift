@@ -625,7 +625,7 @@ open class RedisClient : RedisCommandTarget {
     
     public func errorCaught(context: ChannelHandlerContext, error: Error) {
       self.client.handlerCaughtError(error, in: context)
-      _ = context.close(promise: nil)
+      context.close(promise: nil)
     }
   }
   
