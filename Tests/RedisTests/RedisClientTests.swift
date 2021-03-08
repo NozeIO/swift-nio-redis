@@ -30,7 +30,7 @@ final class RedisClientTests: XCTestCase {
 
   static var allTests = [
     ( "testCreateClientWithDefaultArguments", 
-      testCreateClientWithDefaultArguments.  ),
+      testCreateClientWithDefaultArguments   ),
     ( "testCreateClientWithSpecifiedArguments", 
       testCreateClientWithSpecifiedArguments ),
   ]

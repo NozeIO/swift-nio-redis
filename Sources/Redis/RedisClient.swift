@@ -164,35 +164,21 @@ open class RedisClient : RedisCommandTarget {
     _ = bootstrap.channelOption(ChannelOptions.reuseAddr, value: 1)
     
     _ = bootstrap.channelInitializer { [weak self] channel in
-      #if swift(>=5)
+      
+    return channel.pipeline
+      .configureRedisPipeline()
+      .flatMap { [weak self] in
+        guard let me = self else {
+          //assert(self != nil, "bootstrap running, but client gone?!")
+          let error = channel.eventLoop.makePromise(of: Void.self)
+          error.fail(Error.internalInconsistency)
+          return error.futureResult
+        }
+        
         return channel.pipeline
-          .configureRedisPipeline()
-          .flatMap { [weak self] in
-            guard let me = self else {
-              //assert(self != nil, "bootstrap running, but client gone?!")
-              let error = channel.eventLoop.makePromise(of: Void.self)
-              error.fail(Error.internalInconsistency)
-              return error.futureResult
-            }
-            
-            return channel.pipeline
-              .addHandler(Handler(client: me),
-                          name: "de.zeezide.nio.redis.client")
-          }
-      #else
-        return channel.pipeline
-          .configureRedisPipeline()
-          .thenThrowing { [weak self] in
-            guard let me = self else {
-              //assert(self != nil, "bootstrap running, but client gone?!")
-              throw Error.internalInconsistency
-            }
-            
-            let handler = Handler(client: me)
-            _ = channel.pipeline.add(name: "de.zeezide.nio.redis.client",
-                                     handler: handler)
-          }
-      #endif
+          .addHandler(Handler(client: me),
+                      name: "de.zeezide.nio.redis.client")
+      }
     }
   }
   #if false
@@ -206,8 +192,10 @@ open class RedisClient : RedisCommandTarget {
   var subscribedChannels = Set<String>()
   var subscribedPatterns = Set<String>()
   
-  private var subscribeListeners = EventLoopEventListenerSet<(String, Int)>()
-  private var messageListeners = EventLoopEventListenerSet<(String, String)>()
+  private var subscribeListeners  = EventLoopEventListenerSet<(String, Int)>()
+  private var psubscribeListeners = EventLoopEventListenerSet<(String, Int)>()
+  private var messageListeners =
+    EventLoopEventListenerSet<(String, String, String?)>()
   
   open func subscribe(_ channels: String...) {
     _subscribe(channels: channels)
@@ -282,7 +270,7 @@ open class RedisClient : RedisCommandTarget {
     
     let newPatterns = Set(patterns).subtracting(subscribedPatterns)
     if !newPatterns.isEmpty {
-      subscribedPatterns.formUnion(newChannels)
+      subscribedPatterns.formUnion(newPatterns)
       
       if state.isConnected {
         let call = RedisCommandCall([ "PSUBSCRIBE" ] + newPatterns,
@@ -308,7 +296,35 @@ open class RedisClient : RedisCommandTarget {
   }
   
   @discardableResult
+  open func onPSubscribe(_ cb: @escaping ( String, Int ) -> Void) -> Self {
+    if eventLoop.inEventLoop {
+      psubscribeListeners.append(cb)
+    }
+    else {
+      eventLoop.execute {
+        self.psubscribeListeners.append(cb)
+      }
+    }
+    return self
+  }
+
+  
+  @discardableResult
+  /// Executes the callback when the pub/sub system receives a message.
+  /// The callback parameters are channel and message.
   open func onMessage(_ cb: @escaping ( String, String ) -> Void) -> Self {
+    return onMessage { (channel, message, _) in
+      cb(channel, message)
+    }
+  }
+  
+  /// Executes the callback when the pub/sub system receives a message.
+  /// The callback parameters are channel, message and the pattern in case
+  /// of a pattern subscription.
+  @discardableResult
+  open func onMessage(_ cb: @escaping ( String, String, String? )
+                      -> Void) -> Self
+  {
     if eventLoop.inEventLoop {
       messageListeners.append(cb)
     }
@@ -323,13 +339,8 @@ open class RedisClient : RedisCommandTarget {
   
   // MARK: - Commands
   
-  #if swift(>=5)
   var callQueue    = CircularBuffer<RedisCommandCall>(initialCapacity: 16)
   var pendingCalls = CircularBuffer<RedisCommandCall>(initialCapacity: 16)
-  #else
-  var callQueue    = CircularBuffer<RedisCommandCall>(initialRingCapacity: 16)
-  var pendingCalls = CircularBuffer<RedisCommandCall>(initialRingCapacity: 16)
-  #endif
   
   public func enqueueCommandCall(_ call: RedisCommandCall) { // Q: any
     guard eventLoop.inEventLoop else {
@@ -353,18 +364,10 @@ open class RedisClient : RedisCommandTarget {
         _ = _connect(host: options.hostname ?? "localhost", port: options.port)
       
       case .requestedQuit, .quit:
-        #if swift(>=5)
-          callQueue.forEach { $0.promise.fail(Error.stopped) }
-        #else
-          callQueue.forEach { $0.promise.fail(error: Error.stopped) }
-        #endif
+        callQueue.forEach { $0.promise.fail(Error.stopped) }
       
       case .error(let error):
-        #if swift(>=5)
-          callQueue.forEach { $0.promise.fail(error) }
-        #else
-          callQueue.forEach { $0.promise.fail(error: error) }
-        #endif
+        callQueue.forEach { $0.promise.fail(error) }
 
       case .connecting, .authenticating: break
       
@@ -382,11 +385,7 @@ open class RedisClient : RedisCommandTarget {
       channel.write(call.command)
         .map         { self.pendingCalls.append(call) }
         .whenFailure {
-          #if swift(>=5)
-            call.promise.fail(Error.writeError($0))
-          #else
-            call.promise.fail(error: Error.writeError($0))
-          #endif
+          call.promise.fail(Error.writeError($0))
         }
     }
     channel.flush()
@@ -398,19 +397,11 @@ open class RedisClient : RedisCommandTarget {
     if !pendingCalls.isEmpty {
       let call = pendingCalls.removeFirst()
       
-      #if swift(>=5)
-        if !call.command.isSubscribe {
-          call.promise.succeed(value)
-          return
-        }
-        call.promise.succeed(.bulkString(nil)) // TBD
-      #else
-        if !call.command.isSubscribe {
-          call.promise.succeed(result: value)
-          return
-        }
-        call.promise.succeed(result: .bulkString(nil)) // TBD
-      #endif
+      if !call.command.isSubscribe {
+        call.promise.succeed(value)
+        return
+      }
+      call.promise.succeed(.bulkString(nil)) // TBD
     }
     
     // PubSub handling
@@ -423,13 +414,27 @@ open class RedisClient : RedisCommandTarget {
           if let channel = channel.stringValue,
              let message = message.stringValue
           {
-            return messageListeners.emit( ( channel, message ) )
+            return messageListeners.emit( ( channel, message, nil ) )
           }
-        case ( "subscribe", let channel, let count ):
+        case ( "pmessage", let pattern, let channel ):
+          if items.count > 3,
+             let pattern = pattern.stringValue,
+             let channel = channel.stringValue,
+             let message = items[3].stringValue
+          {
+            return messageListeners.emit( ( channel, message, pattern ) )
+          }
+        case ( "subscribe" , let channel, let count ),
+             ( "psubscribe", let channel, let count ):
           if let channel = channel.stringValue, let count = count.intValue {
-            return subscribeListeners.emit( (channel, count ) )
+            return subscribeListeners.emit( ( channel, count ) )
+          }
+        case ( "psubscribe", let pattern, let count ):
+          if let pattern = pattern.stringValue, let count = count.intValue {
+            return psubscribeListeners.emit( ( pattern, count ) )
           }
         case ( "unsubscribe", _, _ ): return
+        case ( "punsubscribe", _, _ ): return
         default: break
       }
     }
@@ -446,21 +451,12 @@ open class RedisClient : RedisCommandTarget {
   var channel : Channel? { @inline(__always) get { return state.channel } }
   
   public func quit() {
-    #if swift(>=5)
-      _enqueueCommandCall(RedisCommandCall(["QUIT"], eventLoop: eventLoop))
-        .whenComplete { _ in
-          self.state = .quit
-          self.subscribeListeners.removeAll()
-          self.messageListeners.removeAll()
-        }
-    #else
-      _enqueueCommandCall(RedisCommandCall(["QUIT"], eventLoop: eventLoop))
-        .whenComplete {
-          self.state = .quit
-          self.subscribeListeners.removeAll()
-          self.messageListeners.removeAll()
-        }
-    #endif
+    _enqueueCommandCall(RedisCommandCall(["QUIT"], eventLoop: eventLoop))
+      .whenComplete { _ in
+        self.state = .quit
+        self.subscribeListeners.removeAll()
+        self.messageListeners.removeAll()
+      }
     _processQueue()
   }
   
@@ -629,24 +625,8 @@ open class RedisClient : RedisCommandTarget {
     
     public func errorCaught(context: ChannelHandlerContext, error: Error) {
       self.client.handlerCaughtError(error, in: context)
-      _ = context.close(promise: nil)
+      context.close(promise: nil)
     }
-    
-    #if swift(>=5) // NIO 2 API - default
-    #else // NIO 1 API Shims
-      func channelInactive(ctx context: ChannelHandlerContext) {
-        channelInactive(context: context)
-      }
-    
-      func channelRead(ctx context: ChannelHandlerContext, data: NIOAny) {
-        channelRead(context: context, data: data)
-      }
-    
-      public func errorCaught(ctx context: ChannelHandlerContext, error: Error)
-      {
-        errorCaught(context: context, error: error)
-      }
-    #endif // NIO 1 API Shims
   }
   
 }

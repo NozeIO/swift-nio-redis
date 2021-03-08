@@ -91,6 +91,68 @@ public extension RedisCommandTarget { // Future based
     return _enqueue([ "KEYS", pattern ])
   }
   
+  func scan(cursor: String = "0", pattern: String?, count: Int? = nil)
+    -> EventLoopFuture<(String, [String])>
+  {
+    var req = [
+      "SCAN".toRESPValue(),
+      cursor.toRESPValue()
+    ]
+    
+    if let pattern = pattern {
+      req.append("MATCH".toRESPValue())
+      req.append(pattern.toRESPValue())
+    }
+    
+    if let count = count {
+      req.append("COUNT".toRESPValue())
+      req.append(count.toRESPValue())
+    }
+    
+    return _enqueue(req)
+      .flatMapThrowing { (resp: RESPValue) throws -> (String, [String]) in
+        guard case .array(.some(let items)) = resp, items.count == 2,
+              let newCursor = items[0].stringValue,
+              case .array(.some(let keyValues)) = items[1]
+          else
+        {
+          throw RedisTypeTransformationError.unexpectedValueType(resp)
+        }
+        
+        let keys = keyValues.compactMap { $0.stringValue }
+        return ( newCursor, keys )
+      }
+  }
+  
+  func scanAll(pattern: String?, count: Int? = nil, cb: @escaping ([String]) -> ())
+    -> EventLoopFuture<Void>
+  {
+    let promise = self.eventLoop.makePromise(of: Void.self)
+    
+    func scanNext(cursor: String) {
+      let future = self.scan(cursor: cursor, pattern: pattern, count: count)
+      future.whenSuccess() { (newCursor, keys) in
+        if !keys.isEmpty {
+          cb(keys)
+        }
+        
+        if newCursor == "0" {
+          promise.succeed(Void())
+          return
+        }
+        
+        scanNext(cursor: newCursor)
+      }
+      
+      future.whenFailure { (error) in
+        promise.fail(error)
+      }
+    }
+    
+    scanNext(cursor: "0")
+    return promise.futureResult
+  }
+  
   @discardableResult
   func del(keys: [ String ]) -> EventLoopFuture<RESPValue> {
     return _enqueue([ "DEL" ] + keys)
@@ -341,55 +403,29 @@ import class    NIO.EventLoopFuture
 import enum     NIORedis.RESPValue
 import protocol NIORedis.RESPEncodable
 
-#if swift(>=5)
-  fileprivate extension EventLoopFuture {
-    
-    func whenCB(file: StaticString = #file, line: UInt = #line,
-                _ cb: @escaping ( Swift.Error?, Value? ) -> Void) -> Void
-    {
-      self.map(file: file, line: line) { cb(nil, $0) }
-          .whenFailure { cb($0, nil) }
-    }
+fileprivate extension EventLoopFuture {
+  
+  func whenCB(file: StaticString = #file, line: UInt = #line,
+              _ cb: @escaping ( Swift.Error?, Value? ) -> Void) -> Void
+  {
+    self.map(file: file, line: line) { cb(nil, $0) }
+        .whenFailure { cb($0, nil) }
   }
+}
 
-  fileprivate extension EventLoopFuture where Value == RESPValue {
-    
-    func whenCB<U: RedisTypeTransformable>(file: StaticString = #file,
-                                           line: UInt = #line,
-                _ cb: @escaping ( Swift.Error?, U? ) -> Void) -> Void
-    {
-      self.map(file: file, line: line) {
-            do { cb(nil, try U.extractFromRESPValue($0)) }
-            catch { cb(error, nil) }
-          }
-          .whenFailure { cb($0, nil) }
-    }
+fileprivate extension EventLoopFuture where Value == RESPValue {
+  
+  func whenCB<U: RedisTypeTransformable>(file: StaticString = #file,
+                                         line: UInt = #line,
+              _ cb: @escaping ( Swift.Error?, U? ) -> Void) -> Void
+  {
+    self.map(file: file, line: line) {
+          do { cb(nil, try U.extractFromRESPValue($0)) }
+          catch { cb(error, nil) }
+        }
+        .whenFailure { cb($0, nil) }
   }
-#else // NIO1
-  fileprivate extension EventLoopFuture {
-    
-    func whenCB(file: StaticString = #file, line: UInt = #line,
-                _ cb: @escaping ( Swift.Error?, T? ) -> Void) -> Void
-    {
-      self.map(file: file, line: line) { cb(nil, $0) }
-          .whenFailure { cb($0, nil) }
-    }
-  }
-
-  fileprivate extension EventLoopFuture where T == RESPValue {
-    
-    func whenCB<U: RedisTypeTransformable>(file: StaticString = #file,
-                                           line: UInt = #line,
-                _ cb: @escaping ( Swift.Error?, U? ) -> Void) -> Void
-    {
-      self.map(file: file, line: line) {
-            do { cb(nil, try U.extractFromRESPValue($0)) }
-            catch { cb(error, nil) }
-          }
-          .whenFailure { cb($0, nil) }
-    }
-  }
-#endif // NIO1
+}
 
 public extension RedisCommandTarget {
   
@@ -400,15 +436,9 @@ public extension RedisCommandTarget {
   {
     let call   = RedisCommandCall(values, eventLoop: eventLoop)
     
-    #if swift(>=5)
-      let future = call.promise.futureResult.flatMapThrowing {
-        try U.extractFromRESPValue($0)
-      }
-    #else
-      let future = call.promise.futureResult.thenThrowing {
-        try U.extractFromRESPValue($0)
-      }
-    #endif
+    let future = call.promise.futureResult.flatMapThrowing {
+      try U.extractFromRESPValue($0)
+    }
     enqueueCommandCall(call)
     return future
   }
